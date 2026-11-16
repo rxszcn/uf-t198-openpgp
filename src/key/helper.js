@@ -13,6 +13,7 @@ import enums from '../enums.ts';
 import { getPreferredCurveHashAlgo, getHashByteLength, publicKey } from '../crypto/index.js';
 import util from '../util.js';
 import defaultConfig from '../config.ts';
+import { readToEnd as streamReadToEnd } from '@openpgp/web-stream-tools';
 
 export async function generateSecretSubkey(options, config) {
   const secretSubkeyPacket = new SecretSubkeyPacket(options.date, config);
@@ -307,28 +308,101 @@ export async function createSignaturePacket(dataToSign, recipientKeys, signingKe
 }
 
 /**
+ * Returns an identity string for a signature packet, used to detect duplicates when merging keys.
+ *
+ * The identity covers every packet octet that is read back from a serialized signature: the raw
+ * hashed area (`signatureData`, preserved verbatim on parsing, including unknown hashed subpackets),
+ * the unhashed subpackets (preserved verbatim as well), the signed hash prefix, the v6 salt and the
+ * signature material.
+ *
+ * Rationale for this criterion: an OpenPGP signature packet is an opaque unit of key material.
+ * Packets with different hashed or unhashed subpackets (notations, preferences, embedded
+ * signatures, issuer subpackets, unknown subpackets...) are different packets, and discarding one
+ * of them would silently lose key material that cannot be restored from the other. In particular,
+ * v4 signatures can be randomized via a salt notation
+ * (`config.nonDeterministicSignaturesViaNotation`), so two signatures from the same signer, with
+ * the same creation time and the same signature type can legitimately differ; collapsing them by
+ * (signer, time, type) or by signature material alone would drop a valid signature. Conversely,
+ * byte-equal signatures are exact duplicates and can be removed with no information loss.
+ *
+ * Cost is O(size of the signature) per signature, computed once per merge, instead of re-serializing
+ * the material once per pairwise comparison.
+ *
+ * @param {SignaturePacket} signature - Signature to identify
+ * @returns {Promise<String>} Identity string
+ * @async
+ */
+async function getSignatureIdentity(signature) {
+  // Streamed signatures only expose part of their fields asynchronously: materialize them, so that
+  // the serialization below is synchronous and the packet stays usable afterwards.
+  if (signature.params instanceof Promise) {
+    signature.params = await signature.params;
+  }
+  if (util.isStream(signature.signedHashValue)) {
+    signature.signedHashValue = await streamReadToEnd(signature.signedHashValue);
+  }
+  if (util.isStream(signature.salt)) {
+    signature.salt = await streamReadToEnd(signature.salt);
+  }
+  // The hashed area is hashed from `signatureData` rather than re-serialized from the parsed
+  // subpackets, so that unknown hashed subpackets (dropped by `writeHashedSubPackets`) still take
+  // part in the identity.
+  const arr = [
+    signature.signatureData,
+    signature.writeUnhashedSubPackets(),
+    signature.signedHashValue
+  ];
+  if (signature.version === 6) {
+    arr.push(new Uint8Array([signature.salt.length]), signature.salt);
+  }
+  arr.push(signature.writeParams());
+  return util.uint8ArrayToHex(util.concat(arr));
+}
+
+/**
  * Merges signatures from source[attr] to dest[attr]
+ *
+ * Signatures are deduplicated by their serialized form (see `getSignatureIdentity`), and expired
+ * signatures are skipped. The destination signatures are indexed once per call, so the merge is
+ * linear in the total number of signatures, rather than quadratic in their pairwise comparisons
+ * (each of which used to re-serialize the signature material).
+ *
  * @param {Object} source
  * @param {Object} dest
  * @param {String} attr
  * @param {Date} [date] - date to use for signature expiration check, instead of the current time
- * @param {Function} [checkFn] - signature only merged if true
+ * @param {Function} [checkFn] - signature only merged if true. It may inspect and update `dest[attr]`
+ *                               (e.g. `Subkey.update` replaces superseded binding signatures), hence
+ *                               the duplicate index is built after all checks have run.
+ * @param {Function} [onSignatureAdded] - called synchronously right after a source signature has
+ *                               been appended to `dest[attr]`, so that callers can keep their own
+ *                               indexes of `dest[attr]` up to date.
  */
-export async function mergeSignatures(source, dest, attr, date = new Date(), checkFn) {
+export async function mergeSignatures(source, dest, attr, date = new Date(), checkFn, onSignatureAdded) {
   source = source[attr];
-  if (source) {
-    if (!dest[attr].length) {
-      dest[attr] = source;
-    } else {
-      await Promise.all(source.map(async function(sourceSig) {
-        if (!sourceSig.isExpired(date) && (!checkFn || await checkFn(sourceSig)) &&
-            !dest[attr].some(function(destSig) {
-              return util.equalsUint8Array(destSig.writeParams(), sourceSig.writeParams());
-            })) {
-          dest[attr].push(sourceSig);
-        }
-      }));
-    }
+  if (!source) return;
+  if (!dest[attr].length) {
+    dest[attr] = source;
+    return;
+  }
+  // First decide which source signatures are eligible, running the (possibly asynchronous and
+  // expensive) checks in parallel, as before.
+  const eligible = await Promise.all(source.map(async sourceSig => {
+    if (sourceSig.isExpired(date)) return false;
+    return !checkFn || await checkFn(sourceSig);
+  }));
+  // Index the existing signatures only after the checks, since `checkFn` may have updated `dest[attr]`.
+  const identities = new Set();
+  for (const destSig of dest[attr]) {
+    identities.add(await getSignatureIdentity(destSig));
+  }
+  for (let i = 0; i < source.length; i++) {
+    if (!eligible[i]) continue;
+    const identity = await getSignatureIdentity(source[i]);
+    if (identities.has(identity)) continue;
+    identities.add(identity);
+    dest[attr].push(source[i]);
+    onSignatureAdded?.(source[i]);
   }
 }
 

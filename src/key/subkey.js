@@ -142,20 +142,36 @@ class Subkey {
     // update missing binding signatures
     const that = this;
     const dataToVerify = { key: primaryKey, bind: that.keyPacket };
+    // Index the existing binding signatures by issuer once, so that superseding a binding signature
+    // is O(1) per source signature instead of a linear scan (which made the merge quadratic).
+    const bindingSignatureIndexes = new Map();
+    for (let i = 0; i < this.bindingSignatures.length; i++) {
+      const issuerKeyID = this.bindingSignatures[i].issuerKeyID.toHex();
+      // if several signatures share an issuer, the first one is superseded, as in the previous linear scan
+      if (!bindingSignatureIndexes.has(issuerKeyID)) {
+        bindingSignatureIndexes.set(issuerKeyID, i);
+      }
+    }
     await helper.mergeSignatures(subkey, this, 'bindingSignatures', date, async function(srcBindSig) {
-      for (let i = 0; i < that.bindingSignatures.length; i++) {
-        if (that.bindingSignatures[i].issuerKeyID.equals(srcBindSig.issuerKeyID)) {
-          if (srcBindSig.created > that.bindingSignatures[i].created) {
-            that.bindingSignatures[i] = srcBindSig;
-          }
-          return false;
+      const existingIndex = bindingSignatureIndexes.get(srcBindSig.issuerKeyID.toHex());
+      if (existingIndex !== undefined) {
+        if (srcBindSig.created > that.bindingSignatures[existingIndex].created) {
+          that.bindingSignatures[existingIndex] = srcBindSig;
         }
+        return false;
       }
       try {
         await srcBindSig.verify(primaryKey, enums.signature.subkeyBinding, dataToVerify, date, undefined, config);
         return true;
       } catch {
         return false;
+      }
+    }, srcBindSig => {
+      // A newly added binding signature is also superseded by later ones from the same issuer, as it
+      // would be if the checks scanned `this.bindingSignatures` on every iteration.
+      const issuerKeyID = srcBindSig.issuerKeyID.toHex();
+      if (!bindingSignatureIndexes.has(issuerKeyID)) {
+        bindingSignatureIndexes.set(issuerKeyID, that.bindingSignatures.length - 1);
       }
     });
     // revocation signatures
